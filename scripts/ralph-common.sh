@@ -62,6 +62,63 @@ sedi() {
   fi
 }
 
+# Collect stageable paths without recursing into submodules.
+# This avoids failures in repos where nested submodule metadata is incomplete.
+collect_stageable_paths() {
+  local workspace="${1:-.}"
+  local status_output line path
+
+  status_output=$(git -C "$workspace" -c submodule.recurse=false status --porcelain --ignore-submodules=all 2>/dev/null || true)
+  [[ -z "$status_output" ]] && return 0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    path="${line:3}"
+
+    # Handle rename/copy entries in porcelain v1 format: old -> new
+    if [[ "$path" == *" -> "* ]]; then
+      path="${path##* -> }"
+    fi
+
+    [[ -n "$path" ]] && printf '%s\n' "$path"
+  done <<< "$status_output"
+}
+
+# Create a checkpoint commit when there are pending changes.
+# Stages files path-by-path so one problematic path does not block the loop.
+checkpoint_commit_if_needed() {
+  local workspace="${1:-.}"
+  local commit_message="$2"
+  local -a paths=()
+  local path
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && paths+=("$path")
+  done < <(collect_stageable_paths "$workspace")
+
+  if [[ ${#paths[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "📦 Committing uncommitted changes..."
+
+  local staged_any=false
+  for path in "${paths[@]}"; do
+    if git -C "$workspace" add -- "$path" 2>/dev/null; then
+      staged_any=true
+    else
+      echo "   ⚠️  Skipping unstageable path: $path"
+    fi
+  done
+
+  if [[ "$staged_any" != "true" ]]; then
+    echo "   ⚠️  Could not stage checkpoint changes; continuing without checkpoint commit."
+    return 0
+  fi
+
+  git -C "$workspace" commit -m "$commit_message" >/dev/null 2>&1 || true
+}
+
 # Get the .ralph directory for a workspace
 get_ralph_dir() {
   local workspace="${1:-.}"
@@ -409,10 +466,11 @@ You are already in a git repository. Work HERE, not in a subdirectory:
 Ralph's strength is state-in-git, not LLM memory. Commit early and often:
 
 1. After completing each criterion, commit your changes:
-   \`git add -A && git commit -m 'ralph: implement state tracker'\`
-   \`git add -A && git commit -m 'ralph: fix async race condition'\`
-   \`git add -A && git commit -m 'ralph: add CLI adapter with commander'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: implement state tracker'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: fix async race condition'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: add CLI adapter with commander'\`
    Always describe what you actually did - never use placeholders like '<description>'
+   Avoid \`git add -A\` when submodules exist; it can fail due to submodule metadata issues.
 2. After any significant code change (even partial): commit with descriptive message
 3. Before any risky refactor: commit current state as checkpoint
 4. Push after every 2-3 commits: \`git push\`
@@ -523,7 +581,7 @@ run_iteration() {
   # Start parser in background, reading from cursor-agent
   # Parser outputs to fifo, we read signals from fifo
   (
-    eval "$cmd \"$prompt\"" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
+    eval "$cmd \"$prompt\"" 2>&1 | WARN_THRESHOLD="$WARN_THRESHOLD" ROTATE_THRESHOLD="$ROTATE_THRESHOLD" "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
   ) &
   local agent_pid=$!
   
@@ -590,19 +648,15 @@ run_ralph_loop() {
   local workspace="$1"
   local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
   
-  # Commit any uncommitted work first
+  # Create/switch branch first so checkpoint commits land on the intended branch.
   cd "$workspace"
-  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-    echo "📦 Committing uncommitted changes..."
-    git add -A
-    git commit -m "ralph: initial commit before loop" || true
-  fi
-  
-  # Create branch if requested
   if [[ -n "$USE_BRANCH" ]]; then
     echo "🌿 Creating branch: $USE_BRANCH"
     git checkout -b "$USE_BRANCH" 2>/dev/null || git checkout "$USE_BRANCH"
   fi
+
+  # Commit any uncommitted work after branch selection.
+  checkpoint_commit_if_needed "$workspace" "ralph: initial commit before loop"
   
   echo ""
   echo "🚀 Starting Ralph loop..."

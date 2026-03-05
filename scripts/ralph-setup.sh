@@ -347,6 +347,14 @@ main() {
     echo ""
     echo "🧪 Running single iteration first..."
     echo ""
+
+    # Keep behavior consistent with full loop: branch selection before checkpoint commit.
+    cd "$workspace"
+    if [[ -n "$USE_BRANCH" ]]; then
+      echo "🌿 Creating branch: $USE_BRANCH"
+      git checkout -b "$USE_BRANCH" 2>/dev/null || git checkout "$USE_BRANCH"
+    fi
+    checkpoint_commit_if_needed "$workspace" "ralph: initial commit before loop"
     
     # Run just one iteration
     local signal

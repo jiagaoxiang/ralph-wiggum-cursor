@@ -25,9 +25,9 @@ RALPH_DIR="$WORKSPACE/.ralph"
 # Ensure .ralph directory exists
 mkdir -p "$RALPH_DIR"
 
-# Thresholds
-WARN_THRESHOLD=70000
-ROTATE_THRESHOLD=80000
+# Thresholds (can be overridden via environment variables)
+WARN_THRESHOLD="${WARN_THRESHOLD:-70000}"
+ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-80000}"
 
 # Tracking state
 BYTES_READ=0
@@ -37,6 +37,7 @@ SHELL_OUTPUT_CHARS=0
 PROMPT_CHARS=0
 TOOL_CALLS=0
 WARN_SENT=0
+NON_JSON_LINES=0
 
 # Estimate initial prompt size (Ralph prompt is ~2KB + file references)
 PROMPT_CHARS=3000
@@ -204,8 +205,19 @@ process_line() {
   # Skip empty lines
   [[ -z "$line" ]] && return
   
-  # Parse JSON type
-  local type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || return
+  # Parse JSON type; stream-json failures often surface as plain stderr lines.
+  local type
+  type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+  if [[ -z "$type" ]]; then
+    local trimmed="${line//$'\r'/}"
+    if [[ -n "${trimmed//[[:space:]]/}" ]]; then
+      NON_JSON_LINES=$((NON_JSON_LINES + 1))
+      log_error "AGENT STDERR: $trimmed"
+      log_activity "⚠️ AGENT STDERR: $trimmed"
+    fi
+    return
+  fi
+
   local subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null) || true
   
   case "$type" in
@@ -347,6 +359,12 @@ main() {
     fi
   done
   
+  # If the stream was not valid JSON, fail fast instead of silently looping.
+  if [[ $NON_JSON_LINES -gt 0 ]]; then
+    log_error "STREAM FORMAT ERROR: saw $NON_JSON_LINES non-JSON line(s); signaling GUTTER."
+    echo "GUTTER" 2>/dev/null || true
+  fi
+
   # Final token status
   log_token_status
 }

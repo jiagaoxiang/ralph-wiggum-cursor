@@ -207,7 +207,7 @@ main() {
   # Confirm before starting (unless -y flag)
   if [[ "$SKIP_CONFIRM" != "true" ]]; then
     echo "This will run cursor-agent locally to work on this task."
-    echo "The agent will be rotated when context fills up (~80k tokens)."
+    echo "The agent will be warned at ~4.6M and rotated at ~5.0M tokens."
     echo ""
     echo "Tip: Use ralph-setup.sh for interactive model/option selection."
     echo "     Use -y flag to skip this prompt."

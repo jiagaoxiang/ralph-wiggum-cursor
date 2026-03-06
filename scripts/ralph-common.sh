@@ -24,8 +24,8 @@ fi
 # =============================================================================
 
 # Token thresholds
-WARN_THRESHOLD="${WARN_THRESHOLD:-70000}"
-ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-80000}"
+WARN_THRESHOLD="${WARN_THRESHOLD:-4600000}"
+ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-5000000}"
 
 # Iteration limits
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
@@ -60,6 +60,63 @@ sedi() {
   else
     sed -i "$@"
   fi
+}
+
+# Collect stageable paths without recursing into submodules.
+# This avoids failures in repos where nested submodule metadata is incomplete.
+collect_stageable_paths() {
+  local workspace="${1:-.}"
+  local status_output line path
+
+  status_output=$(git -C "$workspace" -c submodule.recurse=false status --porcelain --ignore-submodules=all 2>/dev/null || true)
+  [[ -z "$status_output" ]] && return 0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    path="${line:3}"
+
+    # Handle rename/copy entries in porcelain v1 format: old -> new
+    if [[ "$path" == *" -> "* ]]; then
+      path="${path##* -> }"
+    fi
+
+    [[ -n "$path" ]] && printf '%s\n' "$path"
+  done <<< "$status_output"
+}
+
+# Create a checkpoint commit when there are pending changes.
+# Stages files path-by-path so one problematic path does not block the loop.
+checkpoint_commit_if_needed() {
+  local workspace="${1:-.}"
+  local commit_message="$2"
+  local -a paths=()
+  local path
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && paths+=("$path")
+  done < <(collect_stageable_paths "$workspace")
+
+  if [[ ${#paths[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "📦 Committing uncommitted changes..."
+
+  local staged_any=false
+  for path in "${paths[@]}"; do
+    if git -C "$workspace" add -- "$path" 2>/dev/null; then
+      staged_any=true
+    else
+      echo "   ⚠️  Skipping unstageable path: $path"
+    fi
+  done
+
+  if [[ "$staged_any" != "true" ]]; then
+    echo "   ⚠️  Could not stage checkpoint changes; continuing without checkpoint commit."
+    return 0
+  fi
+
+  git -C "$workspace" commit -m "$commit_message" >/dev/null 2>&1 || true
 }
 
 # Get the .ralph directory for a workspace
@@ -409,10 +466,11 @@ You are already in a git repository. Work HERE, not in a subdirectory:
 Ralph's strength is state-in-git, not LLM memory. Commit early and often:
 
 1. After completing each criterion, commit your changes:
-   \`git add -A && git commit -m 'ralph: implement state tracker'\`
-   \`git add -A && git commit -m 'ralph: fix async race condition'\`
-   \`git add -A && git commit -m 'ralph: add CLI adapter with commander'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: implement state tracker'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: fix async race condition'\`
+   \`git add -- <paths-you-changed> && git commit -m 'ralph: add CLI adapter with commander'\`
    Always describe what you actually did - never use placeholders like '<description>'
+   Avoid \`git add -A\` when submodules exist; it can fail due to submodule metadata issues.
 2. After any significant code change (even partial): commit with descriptive message
 3. Before any risky refactor: commit current state as checkpoint
 4. Push after every 2-3 commits: \`git push\`
@@ -476,6 +534,22 @@ spinner() {
 # ITERATION RUNNER
 # =============================================================================
 
+# Recursively terminate a process tree rooted at PID.
+# This prevents orphaned cursor-agent/parser processes when rotating contexts.
+kill_process_tree() {
+  local root_pid="${1:-}"
+  [[ -z "$root_pid" ]] && return 0
+  [[ ! "$root_pid" =~ ^[0-9]+$ ]] && return 0
+
+  # Collect children first, then terminate leaves before parent.
+  local child_pid
+  while IFS= read -r child_pid; do
+    [[ -n "$child_pid" ]] && kill_process_tree "$child_pid"
+  done < <(ps -eo pid=,ppid= | awk -v p="$root_pid" '$2 == p {print $1}')
+
+  kill "$root_pid" 2>/dev/null || true
+}
+
 # Run a single agent iteration
 # Returns: signal (ROTATE, GUTTER, COMPLETE, or empty)
 run_iteration() {
@@ -486,6 +560,12 @@ run_iteration() {
   
   local prompt=$(build_prompt "$workspace" "$iteration")
   local fifo="$workspace/.ralph/.parser_fifo"
+  local raw_stream_file
+  local agent_exit_file
+  local parser_exit_file
+  raw_stream_file=$(mktemp)
+  agent_exit_file=$(mktemp)
+  parser_exit_file=$(mktemp)
   
   # Create named pipe for parser signals
   rm -f "$fifo"
@@ -505,12 +585,13 @@ run_iteration() {
   # Log session start to progress.md
   log_progress "$workspace" "**Session $iteration started** (model: $MODEL)"
   
-  # Build cursor-agent command
-  local cmd="cursor-agent -p --force --output-format stream-json --model $MODEL"
+  # Build cursor-agent command as an argv array so model names containing
+  # punctuation/whitespace are passed safely without eval/string splitting.
+  local -a cmd=(cursor-agent -p --force --output-format stream-json --model "$MODEL")
   
   if [[ -n "$session_id" ]]; then
     echo "Resuming session: $session_id" >&2
-    cmd="$cmd --resume=\"$session_id\""
+    cmd+=(--resume "$session_id")
   fi
   
   # Change to workspace
@@ -523,7 +604,11 @@ run_iteration() {
   # Start parser in background, reading from cursor-agent
   # Parser outputs to fifo, we read signals from fifo
   (
-    eval "$cmd \"$prompt\"" 2>&1 | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
+    set +e
+    "${cmd[@]}" "$prompt" 2>&1 | tee "$raw_stream_file" | "$script_dir/stream-parser.sh" "$workspace" > "$fifo"
+    local st=("${PIPESTATUS[@]}")
+    echo "${st[0]:-0}" > "$agent_exit_file"
+    echo "${st[2]:-0}" > "$parser_exit_file"
   ) &
   local agent_pid=$!
   
@@ -534,7 +619,7 @@ run_iteration() {
       "ROTATE")
         printf "\r\033[K" >&2  # Clear spinner line
         echo "🔄 Context rotation triggered - stopping agent..." >&2
-        kill $agent_pid 2>/dev/null || true
+        kill_process_tree "$agent_pid"
         signal="ROTATE"
         break
         ;;
@@ -560,13 +645,43 @@ run_iteration() {
         echo "⏸️  Rate limit or transient error - deferring for retry..." >&2
         signal="DEFER"
         # Stop the agent, will retry with backoff
-        kill $agent_pid 2>/dev/null || true
+        kill_process_tree "$agent_pid"
         ;;
     esac
   done < "$fifo"
   
   # Wait for agent to finish
   wait $agent_pid 2>/dev/null || true
+
+  # Inspect execution outcome. If cursor-agent exits non-zero before emitting
+  # any stream-json events, fail loudly so the loop does not silently spin.
+  local agent_exit=0
+  local parser_exit=0
+  if [[ -f "$agent_exit_file" ]]; then
+    agent_exit=$(cat "$agent_exit_file" 2>/dev/null || echo 1)
+  fi
+  if [[ -f "$parser_exit_file" ]]; then
+    parser_exit=$(cat "$parser_exit_file" 2>/dev/null || echo 1)
+  fi
+  local has_json=0
+  if [[ -s "$raw_stream_file" ]] && grep -Eq '^[[:space:]]*\{.*"type"[[:space:]]*:' "$raw_stream_file"; then
+    has_json=1
+  fi
+  if [[ -z "$signal" ]] && [[ "$agent_exit" -ne 0 ]] && [[ "$has_json" -eq 0 ]]; then
+    local first_line=""
+    first_line=$(awk 'NF {print; exit}' "$raw_stream_file" 2>/dev/null || true)
+    first_line="${first_line:0:300}"
+    printf "\r\033[K" >&2
+    echo "❌ cursor-agent failed before producing stream-json (exit $agent_exit)." >&2
+    if [[ -n "$first_line" ]]; then
+      echo "   First output: $first_line" >&2
+    fi
+    if [[ "$parser_exit" -ne 0 ]]; then
+      echo "   stream-parser exit: $parser_exit" >&2
+    fi
+    log_error "$workspace" "cursor-agent non-zero without JSON (iteration=$iteration, model=$MODEL, exit=$agent_exit)"
+    signal="GUTTER"
+  fi
   
   # Stop spinner and clear line
   kill $spinner_pid 2>/dev/null || true
@@ -575,6 +690,7 @@ run_iteration() {
   
   # Cleanup
   rm -f "$fifo"
+  rm -f "$raw_stream_file" "$agent_exit_file" "$parser_exit_file"
   
   echo "$signal"
 }
@@ -590,19 +706,15 @@ run_ralph_loop() {
   local workspace="$1"
   local script_dir="${2:-$(dirname "${BASH_SOURCE[0]}")}"
   
-  # Commit any uncommitted work first
+  # Create/switch branch first so checkpoint commits land on the intended branch.
   cd "$workspace"
-  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-    echo "📦 Committing uncommitted changes..."
-    git add -A
-    git commit -m "ralph: initial commit before loop" || true
-  fi
-  
-  # Create branch if requested
   if [[ -n "$USE_BRANCH" ]]; then
     echo "🌿 Creating branch: $USE_BRANCH"
     git checkout -b "$USE_BRANCH" 2>/dev/null || git checkout "$USE_BRANCH"
   fi
+
+  # Commit any uncommitted work after branch selection.
+  checkpoint_commit_if_needed "$workspace" "ralph: initial commit before loop"
   
   echo ""
   echo "🚀 Starting Ralph loop..."

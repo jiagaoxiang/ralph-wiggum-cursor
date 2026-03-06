@@ -44,6 +44,8 @@ fi
 MODELS=(
   "opus-4.5-thinking"
   "sonnet-4.5-thinking"
+  "opus-4.6-thinking"
+  "gpt-5.3-codex-xhigh-fast"
   "gpt-5.2-high"
   "composer-1"
   "Custom..."
@@ -60,18 +62,18 @@ select_model() {
     fi
     echo "$selected"
   else
-    echo ""
-    echo "Select model:"
+    echo "" >&2
+    echo "Select model:" >&2
     local i=1
     for m in "${MODELS[@]}"; do
       if [[ "$m" == "Custom..." ]]; then
-        echo "  $i) Custom (enter manually)"
+        echo "  $i) Custom (enter manually)" >&2
       else
-        echo "  $i) $m"
+        echo "  $i) $m" >&2
       fi
       ((i++))
     done
-    echo ""
+    echo "" >&2
     read -p "Choice [1]: " choice
     choice="${choice:-1}"
     
@@ -81,6 +83,9 @@ select_model() {
         read -p "Enter model name: " selected
       fi
       echo "$selected"
+    elif [[ -n "$choice" ]]; then
+      # Allow typing a model name directly (not just numeric menu index).
+      echo "$choice"
     else
       echo "${MODELS[0]}"
     fi
@@ -116,14 +121,14 @@ select_options() {
     selected=$(gum choose --no-limit --header "Options (space to select, enter to confirm):" "${options[@]}") || true
     echo "$selected"
   else
-    echo ""
-    echo "Options (enter numbers separated by spaces, or press Enter to skip):"
+    echo "" >&2
+    echo "Options (enter numbers separated by spaces, or press Enter to skip):" >&2
     local i=1
     for opt in "${options[@]}"; do
-      echo "  $i) $opt"
+      echo "  $i) $opt" >&2
       ((i++))
     done
-    echo ""
+    echo "" >&2
     read -p "Select options [none]: " choices
     
     local selected=""
@@ -271,8 +276,8 @@ main() {
   
   # Parse selected options
   local run_single_first=false
-  local parallel_mode=false
-  local max_parallel=3
+  local parallel_mode=tbranch_cleanup
+  local max_parallel=8
   USE_BRANCH=""
   OPEN_PR=false
   
@@ -347,6 +352,14 @@ main() {
     echo ""
     echo "🧪 Running single iteration first..."
     echo ""
+
+    # Keep behavior consistent with full loop: branch selection before checkpoint commit.
+    cd "$workspace"
+    if [[ -n "$USE_BRANCH" ]]; then
+      echo "🌿 Creating branch: $USE_BRANCH"
+      git checkout -b "$USE_BRANCH" 2>/dev/null || git checkout "$USE_BRANCH"
+    fi
+    checkpoint_commit_if_needed "$workspace" "ralph: initial commit before loop"
     
     # Run just one iteration
     local signal

@@ -18,7 +18,7 @@ WORKTREE_BASE_DIR=".ralph-worktrees"
 PARALLEL_STATE_DIR=".ralph/parallel"
 PARALLEL_LOCK_DIR=".ralph/locks/parallel.lock"
 
-MAX_PARALLEL="${MAX_PARALLEL:-3}"
+MAX_PARALLEL="${MAX_PARALLEL:-8}"
 SKIP_MERGE="${SKIP_MERGE:-false}"
 CREATE_PR="${CREATE_PR:-false}"
 

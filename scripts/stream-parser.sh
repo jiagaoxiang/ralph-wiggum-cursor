@@ -8,8 +8,8 @@
 #   cursor-agent -p --force --output-format stream-json "..." | ./stream-parser.sh /path/to/workspace
 #
 # Outputs to stdout:
-#   - ROTATE when threshold hit (80k tokens)
-#   - WARN when approaching limit (70k tokens)
+#   - ROTATE when threshold hit (5M tokens)
+#   - WARN when approaching limit (4.6M tokens)
 #   - GUTTER when stuck pattern detected
 #   - COMPLETE when agent outputs <ralph>COMPLETE</ralph>
 #
@@ -26,8 +26,16 @@ RALPH_DIR="$WORKSPACE/.ralph"
 mkdir -p "$RALPH_DIR"
 
 # Thresholds
-WARN_THRESHOLD=70000
-ROTATE_THRESHOLD=80000
+WARN_THRESHOLD="${WARN_THRESHOLD:-4600000}"
+ROTATE_THRESHOLD="${ROTATE_THRESHOLD:-5000000}"
+
+# Cap repeated reads of the same file within one parser session (typically one
+# Ralph iteration). Reads beyond the cap are logged but excluded from token
+# accounting to reduce rotate loops caused by read thrashing.
+READ_REPEAT_CAP="${READ_REPEAT_CAP:-2}"
+if ! [[ "$READ_REPEAT_CAP" =~ ^[0-9]+$ ]] || [[ "$READ_REPEAT_CAP" -lt 1 ]]; then
+  READ_REPEAT_CAP=2
+fi
 
 # Tracking state
 BYTES_READ=0
@@ -44,7 +52,8 @@ PROMPT_CHARS=3000
 # Gutter detection - use temp files instead of associative arrays (macOS bash 3.x compat)
 FAILURES_FILE=$(mktemp)
 WRITES_FILE=$(mktemp)
-trap "rm -f $FAILURES_FILE $WRITES_FILE" EXIT
+READS_FILE=$(mktemp)
+trap "rm -f $FAILURES_FILE $WRITES_FILE $READS_FILE" EXIT
 
 # Get context health emoji
 get_health_emoji() {
@@ -197,6 +206,32 @@ track_file_write() {
   fi
 }
 
+# Track read token budget with per-file repeat cap.
+track_file_read() {
+  local path="$1"
+  local lines="$2"
+  local bytes="$3"
+
+  # grep -c may return non-zero when no matches; keep count robust.
+  local prior_count
+  prior_count=$(grep -Fxc -- "$path" "$READS_FILE" 2>/dev/null || true)
+  prior_count="${prior_count:-0}"
+  local read_index=$((prior_count + 1))
+
+  # Record every read to preserve accurate repeat index in logs.
+  echo "$path" >> "$READS_FILE"
+
+  local kb
+  kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+
+  if [[ $read_index -le $READ_REPEAT_CAP ]]; then
+    BYTES_READ=$((BYTES_READ + bytes))
+    log_activity "READ $path ($lines lines, ~${kb}KB, read ${read_index}/${READ_REPEAT_CAP})"
+  else
+    log_activity "READ-CAPPED $path ($lines lines, ~${kb}KB, read ${read_index}/${READ_REPEAT_CAP}; bytes excluded)"
+  fi
+}
+
 # Process a single JSON line from stream
 process_line() {
   local line="$1"
@@ -272,10 +307,10 @@ process_line() {
           else
             bytes=$((lines * 100))  # ~100 chars/line for code
           fi
-          BYTES_READ=$((BYTES_READ + bytes))
-          
-          local kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-          log_activity "READ $path ($lines lines, ~${kb}KB)"
+          if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+            bytes=0
+          fi
+          track_file_read "$path" "$lines" "$bytes"
           
         # Handle write tool completion
         elif echo "$line" | jq -e '.tool_call.writeToolCall.result.success' > /dev/null 2>&1; then
